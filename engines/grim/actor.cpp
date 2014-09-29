@@ -51,24 +51,52 @@ Shadow::Shadow() :
 		shadowMask(nullptr), shadowMaskSize(0), active(false), dontNegate(false), userData(nullptr) {
 }
 
-static int animTurn(float turnAmt, const Math::Angle &dest, Math::Angle *cur) {
-	Math::Angle d = dest - *cur;
+// Helper functions to always convert between angles and quats properly
+static Math::Quaternion eulerToQuat(const Math::Angle &pitch, const Math::Angle &yaw, const Math::Angle &roll) {
+	if (g_grim->getGameType() == GType_GRIM)
+		return Math::Quaternion::fromEuler(yaw, pitch, roll, Math::EO_ZXY);
+	else
+		return Math::Quaternion::fromEuler(roll, yaw, pitch, Math::EO_ZYX);
+}
+
+static void quatToEuler(const Math::Quaternion &q, Math::Angle *pitch, Math::Angle *yaw, Math::Angle *roll) {
+	if (g_grim->getGameType() == GType_GRIM)
+		q.getEuler(yaw, pitch, roll, Math::EO_ZXY);
+	else
+		q.getEuler(roll, yaw, pitch, Math::EO_ZYX);
+}
+
+static float turnDir(float turnAmt, const Math::Angle &dest, const Math::Angle &cur) {
+	Math::Angle d = dest - cur;
+	// Clamps the angle between -180 and 180
 	d.normalize(-180);
+	if (d != 0) {
+		return (d > 0 ? 1.0f : -1.0f);
+	}
+	return 0.0f;
+}
+
+static Math::Vector3d animTurn(float turnAmt, const Math::Quaternion &dest, Math::Quaternion &cur) {
+	// Figure out the direction of rotation for each angle
+	Math::Angle curP, curY, curR;
+	quatToEuler(cur, &curP, &curY, &curR);
+
+	Math::Angle turnP, turnY, turnR;
+	quatToEuler(dest, &turnP, &turnY, &turnR);
+
+	Math::Vector3d turnDirection(turnDir(turnAmt, turnP, curP), turnDir(turnAmt, turnY, curY), turnDir(turnAmt, turnR, curR));
+
+	// Slerp between the quats to perform the rotation
 	// If the actor won't turn because the rate is set to zero then
 	// have the actor turn all the way to the destination yaw.
 	// Without this some actors will lock the interface on changing
 	// scenes, this affects the Bone Wagon in particular.
-	if (turnAmt == 0 || turnAmt >= fabsf(d.getDegrees())) {
-		*cur = dest;
-	} else if (d > 0) {
-		*cur += turnAmt;
-	} else {
-		*cur -= turnAmt;
-	}
-	if (d != 0) {
-		return (d > 0 ? 1 : -1);
-	}
-	return 0;
+	if (turnAmt == 0)
+		cur = dest;
+	else
+		cur.slerpQuat(dest, turnAmt);
+
+	return turnDirection;
 }
 
 bool Actor::_isTalkingBackground = false;
@@ -84,7 +112,7 @@ void Actor::restoreStaticState(SaveGame *state) {
 Actor::Actor() :
 		_talkColor(255, 255, 255), _pos(0, 0, 0),
 		_lookingMode(false), _followBoxes(false), _running(false), 
-		_pitch(0), _yaw(0), _roll(0), _walkRate(0.3f),
+		_rot(0.f, 0.f, 0.f, 1.f), _walkRate(0.3f),
 		_turnRateMultiplier(0.f), _talkAnim(0),
 		_reflectionAngle(80), _scale(1.f), _timeScale(1.f),
 		_visible(true), _lipSync(nullptr), _turning(false), _walking(false),
@@ -136,9 +164,12 @@ void Actor::saveState(SaveGame *savedState) const {
 
 	savedState->writeVector3d(_pos);
 
-	savedState->writeFloat(_pitch.getDegrees());
-	savedState->writeFloat(_yaw.getDegrees());
-	savedState->writeFloat(_roll.getDegrees());
+	// Save the rotation Quaternion
+	savedState->writeFloat(_rot.x());
+	savedState->writeFloat(_rot.y());
+	savedState->writeFloat(_rot.z());
+	savedState->writeFloat(_rot.w());
+
 	savedState->writeFloat(_walkRate);
 	savedState->writeFloat(_turnRate);
 	savedState->writeFloat(_turnRateMultiplier);
@@ -184,9 +215,12 @@ void Actor::saveState(SaveGame *savedState) const {
 	}
 
 	savedState->writeBool(_turning);
-	savedState->writeFloat(_moveYaw.getDegrees());
-	savedState->writeFloat(_movePitch.getDegrees());
-	savedState->writeFloat(_moveRoll.getDegrees());
+
+	// Write out the turning quaternion
+	savedState->writeFloat(_turnTo.x());
+	savedState->writeFloat(_turnTo.y());
+	savedState->writeFloat(_turnTo.z());
+	savedState->writeFloat(_turnTo.w());
 
 	savedState->writeBool(_walking);
 	savedState->writeVector3d(_destPos);
@@ -289,9 +323,19 @@ bool Actor::restoreState(SaveGame *savedState) {
 	_talkColor = savedState->readColor();
 
 	_pos                = savedState->readVector3d();
-	_pitch              = savedState->readFloat();
-	_yaw                = savedState->readFloat();
-	_roll               = savedState->readFloat();
+	// Old versions save Euler angles instead of the quaternion
+	if (savedState->saveMinorVersion() < 26) {
+		Math::Angle p(savedState->readFloat());
+		Math::Angle y(savedState->readFloat());
+		Math::Angle r(savedState->readFloat());
+		_rot = eulerToQuat(p, y, r);
+	} else {
+		float x = savedState->readFloat();
+		float y = savedState->readFloat();
+		float z = savedState->readFloat();
+		float w = savedState->readFloat();
+		_rot = Math::Quaternion(x, y, z, w);
+	}
 	_walkRate           = savedState->readFloat();
 	_turnRate           = savedState->readFloat();
 	if (savedState->saveMinorVersion() > 6) {
@@ -349,13 +393,25 @@ bool Actor::restoreState(SaveGame *savedState) {
 	}
 
 	_turning = savedState->readBool();
-	_moveYaw = savedState->readFloat();
-	if (savedState->saveMinorVersion() > 6) {
-		_movePitch = savedState->readFloat();
-		_moveRoll = savedState->readFloat();
+
+	// Build the Quaternion from the saved Euler Angles
+	if (savedState->saveMinorVersion() < 26) {
+		Math::Angle y(savedState->readFloat());
+		Math::Angle p, r;
+		if (savedState->saveMinorVersion() > 6) {
+			p = Math::Angle(savedState->readFloat());
+			r = Math::Angle(savedState->readFloat());
+		} else {
+			p = getPitch();
+			r = getRoll();
+		}
+		_turnTo = eulerToQuat(p, y, r);
 	} else {
-		_movePitch = _pitch;
-		_moveRoll = _roll;
+		float x = savedState->readFloat();
+		float y = savedState->readFloat();
+		float z = savedState->readFloat();
+		float w = savedState->readFloat();
+		_turnTo = Math::Quaternion(x, y, z, w);
 	}
 
 	_walking = savedState->readBool();
@@ -495,6 +551,24 @@ bool Actor::restoreState(SaveGame *savedState) {
 	return true;
 }
 
+Math::Angle Actor::getPitch() const {
+	Math::Angle p;
+	quatToEuler(_rot, &p, nullptr, nullptr);
+	return p;
+}
+
+Math::Angle Actor::getYaw() const {
+	Math::Angle y;
+	quatToEuler(_rot, nullptr, &y, nullptr);
+	return y;
+}
+
+Math::Angle Actor::getRoll() const {
+	Math::Angle r;
+	quatToEuler(_rot, nullptr, nullptr, &r);
+	return r;
+}
+
 void Actor::setRot(const Math::Vector3d &pos) {
 	Math::Angle y, p, r;
 	calculateOrientation(pos, &p, &y, &r);
@@ -502,10 +576,8 @@ void Actor::setRot(const Math::Vector3d &pos) {
 }
 
 void Actor::setRot(const Math::Angle &pitchParam, const Math::Angle &yawParam, const Math::Angle &rollParam) {
-	_pitch = pitchParam;
-	_yaw = yawParam;
-	_moveYaw = _yaw;
-	_roll = rollParam;
+	_rot = eulerToQuat(pitchParam, yawParam, rollParam);
+	_turnTo = _rot;
 	_turning = false;
 }
 
@@ -546,13 +618,13 @@ void Actor::calculateOrientation(const Math::Vector3d &pos, Math::Angle *pitch, 
 
 	Math::Matrix3 m;
 	m.buildFromTargetDir(actorForward, lookVector, actorUp, up);
+	Math::Quaternion q(m);
 
 	if (_puckOrient) {
-		m.getEuler(yaw, pitch, roll, Math::EO_ZXY);
+		quatToEuler(q, pitch, yaw, roll);
 	} else {
-		*pitch = _movePitch;
-		m.getEuler(yaw, nullptr, nullptr, Math::EO_ZXY);
-		*roll = _moveRoll;
+		quatToEuler(_turnTo, pitch, nullptr, roll);
+		quatToEuler(q, nullptr, yaw, nullptr);
 	}
 }
 
@@ -567,25 +639,26 @@ bool Actor::singleTurnTo(const Math::Vector3d &pos) {
 	calculateOrientation(pos, &p, &y, &r);
 
 	float turnAmt = g_grim->getPerSecond(_turnRate);
-	bool done = animTurn(turnAmt, y, &_yaw) == 0;
-	done = animTurn(turnAmt, p, &_pitch) == 0 && done;
-	done = animTurn(turnAmt, r, &_roll) == 0 && done;
-	_moveYaw = _yaw;
-	_movePitch = _pitch;
-	_moveRoll = _roll;
+	Math::Quaternion q = eulerToQuat(p, y, r);
+	_rot.slerpQuat(q, turnAmt);
+	_turnTo = _rot;
 
-	return done;
+	if (q == _rot) {
+		return true;
+	} else {
+		return false;
+	}
 }
 
 void Actor::turnTo(const Math::Angle &pitchParam, const Math::Angle &yawParam, const Math::Angle &rollParam, bool snap) {
-	_movePitch = pitchParam;
-	_moveRoll = rollParam;
-	_moveYaw = yawParam;
+	_turnTo = eulerToQuat(pitchParam, yawParam, rollParam);
 	_turnRateMultiplier = (snap ? 5.f : 1.f);
-	if (_yaw != yawParam || _pitch != pitchParam || _roll != rollParam) {
+
+	if (_rot != _turnTo) {
 		_turning = true;
-	} else
+	} else {
 		_turning = false;
+	}
 }
 
 void Actor::walkTo(const Math::Vector3d &p) {
@@ -797,9 +870,11 @@ void Actor::walkForward() {
 
 	_walking = false;
 
+	Math::Angle moveYaw;
+	quatToEuler(_turnTo, nullptr, &moveYaw, nullptr);
+
 	if (!_followBoxes) {
-		Math::Vector3d forwardVec(-_moveYaw.getSine() * _pitch.getCosine(),
-								  _moveYaw.getCosine() * _pitch.getCosine(), _pitch.getSine());
+		Math::Vector3d forwardVec(-moveYaw.getSine() * getPitch().getCosine(), moveYaw.getCosine() * getPitch().getCosine(), getPitch().getSine());
 
 		// EMI: Y is up-down, actors use an X-Z plane for movement
 		if (g_grim->getGameType() == GType_MONKEY4) {
@@ -827,8 +902,7 @@ void Actor::walkForward() {
 
 		g_grim->getCurrSet()->findClosestSector(_pos, &currSector, &_pos);
 		if (!currSector) { // Shouldn't happen...
-			Math::Vector3d forwardVec(-_moveYaw.getSine() * _pitch.getCosine(),
-									  _moveYaw.getCosine() * _pitch.getCosine(), _pitch.getSine());
+			Math::Vector3d forwardVec(-moveYaw.getSine() * getPitch().getCosine(), moveYaw.getCosine() * getPitch().getCosine(), getPitch().getSine());
 
 			// EMI: Y is up-down, actors use an X-Z plane for movement
 			if (g_grim->getGameType() == GType_MONKEY4) {
@@ -852,22 +926,21 @@ void Actor::walkForward() {
 			prevSector = currSector;
 			Math::Vector3d forwardVec;
 			const Math::Vector3d &normal = currSector->getNormal();
+
 			if (g_grim->getGameType() == GType_GRIM) {
 				Math::Angle ax = Math::Vector2d(normal.x(), normal.z()).getAngle();
 				Math::Angle ay = Math::Vector2d(normal.y(), normal.z()).getAngle();
 
-				float z1 = -_moveYaw.getCosine() * (ay - _pitch).getCosine();
-				float z2 = _moveYaw.getSine() * (ax - _pitch).getCosine();
-				forwardVec = Math::Vector3d(-_moveYaw.getSine() * ax.getSine() * _pitch.getCosine(),
-											_moveYaw.getCosine() * ay.getSine() * _pitch.getCosine(), z1 + z2);
+				float z1 = -moveYaw.getCosine() * (ay - getPitch()).getCosine();
+				float z2 = moveYaw.getSine() * (ax - getPitch()).getCosine();
+				forwardVec = Math::Vector3d(-moveYaw.getSine() * ax.getSine() * getPitch().getCosine(), moveYaw.getCosine() * ay.getSine() * getPitch().getCosine(), z1 + z2);
 			} else {
 				Math::Angle ax = Math::Vector2d(normal.x(), normal.y()).getAngle();
 				Math::Angle az = Math::Vector2d(normal.z(), normal.y()).getAngle();
 
-				float y1 = _moveYaw.getCosine() * (az - _pitch).getCosine();
-				float y2 = _moveYaw.getSine() * (ax - _pitch).getCosine();
-				forwardVec = Math::Vector3d(-_moveYaw.getSine() * ax.getSine() * _pitch.getCosine(), y1 + y2,
-											-_moveYaw.getCosine() * az.getSine() * _pitch.getCosine());
+				float y1 = moveYaw.getCosine() * (az - getPitch()).getCosine();
+				float y2 = moveYaw.getSine() * (ax - getPitch()).getCosine();
+				forwardVec = Math::Vector3d(-moveYaw.getSine() * ax.getSine() * getPitch().getCosine(), y1 + y2, -moveYaw.getCosine() * az.getSine() * getPitch().getCosine());
 			}
 
 			if (backwards)
@@ -916,7 +989,8 @@ void Actor::walkForward() {
 		if (g_grim->getGameType() == GType_MONKEY4) {
 			ei.angleWithEdge = -ei.angleWithEdge;
 		}
-		turnTo(0, _moveYaw + ei.angleWithEdge * turnDir, 0, true);
+
+		turnTo(0, moveYaw + ei.angleWithEdge * turnDir, 0, true);
 
 		if (oldDist <= dist + 0.001f) {
 			// If we didn't move at all, keep trying a couple more times
@@ -933,14 +1007,14 @@ Math::Vector3d Actor::getSimplePuckVector() const {
 		Math::Angle yaw = 0;
 		const Actor *a = this;
 		while (a) {
-			yaw += a->_yaw;
+			yaw += a->getYaw();
 			if (!a->isAttached())
 				break;
 			a = Actor::getPool().getObject(a->_attachedActor);
 		}
 		return Math::Vector3d(yaw.getSine(), 0, yaw.getCosine());
 	} else {
-		return Math::Vector3d(-_yaw.getSine(), _yaw.getCosine(), 0);
+		return Math::Vector3d(-getYaw().getSine(), getYaw().getCosine(), 0);
 	}
 }
 
@@ -1091,7 +1165,10 @@ void Actor::turn(int dir) {
 	if (g_grim->getGameType() == GType_MONKEY4) {
 		delta = -delta;
 	}
-	_moveYaw = _moveYaw + delta;
+
+	Math::Quaternion qDelta = eulerToQuat(Math::Angle(0.0f), delta, Math::Angle(0.0f));
+	_turnTo = qDelta * _turnTo;
+
 	_turning = true;
 	_turnRateMultiplier = 5.f;
 	_currTurnDir = dir;
@@ -1490,13 +1567,12 @@ void Actor::update(uint frameTime) {
 
 	if (_turning) {
 		float turnAmt = g_grim->getPerSecond(_turnRate) * _turnRateMultiplier;
-		_currTurnDir = animTurn(turnAmt, _moveYaw, &_yaw);
+		Math::Vector3d turnDirVec = animTurn(turnAmt, _turnTo, _rot);
+		_currTurnDir = (int) turnDirVec.x();
 		if (g_grim->getGameType() == GType_MONKEY4) {
 			_currTurnDir = -_currTurnDir;
 		}
-		int p = animTurn(turnAmt, _movePitch, &_pitch);
-		int r = animTurn(turnAmt, _moveRoll, &_roll);
-		if (_currTurnDir == 0 && p == 0 && r == 0) {
+		if (_currTurnDir == 0 && turnDirVec.y() == 0.0f && turnDirVec.z() == 0.0f) {
 			_turning = false;
 			_turnRateMultiplier = 1.f;
 		}
@@ -1622,7 +1698,10 @@ void Actor::update(uint frameTime) {
 	frameTime = (uint)(frameTime * _timeScale);
 	for (Common::List<Costume *>::iterator i = _costumeStack.begin(); i != _costumeStack.end(); ++i) {
 		Costume *c = *i;
-		c->setPosRotate(_pos, _pitch, _yaw, _roll);
+		Math::Angle p, y, r;
+		quatToEuler(_rot, &p, &y, &r);
+		c->setPosRotate(_pos, p, y, r);
+
 		int marker = c->update(frameTime);
 		if (marker > 0) {
 			costumeMarkerCallback(marker);
@@ -2115,7 +2194,7 @@ bool Actor::handleCollisionWith(Actor *actor, CollisionMode mode, Math::Vector3d
 			bboxPos = pos + bboxPos1;
 			size =  bboxSize1;
 			scale = _collisionScale;
-			yaw = _yaw;
+			yaw = getYaw();
 
 			circle.setX(p2.x());
 			circle.setY(p2.y());
@@ -2126,7 +2205,7 @@ bool Actor::handleCollisionWith(Actor *actor, CollisionMode mode, Math::Vector3d
 			bboxPos = p2  + bboxPos2;
 			size = bboxSize2;
 			scale = actor->_collisionScale;
-			yaw = actor->_yaw;
+			yaw = actor->getYaw();
 
 			circle.setX(p1.x() + vec->x());
 			circle.setY(p1.y() + vec->y());
@@ -2287,7 +2366,7 @@ Math::Quaternion Actor::getRotationQuat() const {
 		const Math::Matrix4 m = getFinalMatrix();
 		return Math::Quaternion(m).inverse();
 	} else {
-		return Math::Quaternion::fromEuler(_yaw, _pitch, _roll, Math::EO_ZXY).inverse();
+		return Math::Quaternion::fromEuler(getYaw(), getPitch(), getRoll(), Math::EO_ZXY).inverse();
 	}
 }
 
@@ -2310,7 +2389,7 @@ Math::Vector3d Actor::getHeadPos() const {
 
 			Math::Matrix4 matrix;
 			matrix.setPosition(_pos);
-			matrix.buildFromEuler(_yaw, _pitch, _roll, Math::EO_ZXY);
+			matrix.buildFromEuler(getYaw(), getPitch(), getRoll(), Math::EO_ZXY);
 			root->setMatrix(matrix);
 			root->update();
 
@@ -2432,9 +2511,8 @@ void Actor::attachToActor(Actor *parent, const char *joint) {
 		j->_finalMatrix.transpose();
 		j->_finalMatrix.transform(&_pos, true);
 	}
-
-	// Get the final rotation euler coordinates
-	newRot.getEuler(&_roll, &_yaw, &_pitch, Math::EO_ZYX);
+	// Update the final rotation
+	_rot = newRot;
 
 	// Get the final position coordinates
 	_pos = _pos - parentMatrix.getPosition();
@@ -2464,8 +2542,7 @@ void Actor::detach() {
 
 	// Position and rotate the actor in relation to the world coords
 	setPos(getWorldPos());
-	Math::Quaternion q = getRotationQuat();
-	q.inverse().getEuler(&_roll, &_yaw, &_pitch, Math::EO_ZYX);
+	_rot = getRotationQuat();
 
 	// Remove the attached actor
 	_attachedActor = 0;

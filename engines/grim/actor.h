@@ -278,7 +278,7 @@ public:
 	 * @see turnTo
 	 * @see isTurning
 	 */
-	Math::Angle getPitch() const { return _pitch; }
+	Math::Angle getPitch() const;
 	/**
 	 * Returns the yaw of the actor, which is the rotation
 	 * on the z axis.
@@ -289,7 +289,7 @@ public:
 	 * @see turnTo
 	 * @see isTurning
 	 */
-	Math::Angle getYaw() const { return _yaw; }
+	Math::Angle getYaw() const;
 	/**
 	 * Returns the roll of the actor, which is the rotation
 	 * on the y axis.
@@ -300,7 +300,7 @@ public:
 	 * @see turnTo
 	 * @see isTurning
 	 */
-	Math::Angle getRoll() const { return _roll; }
+	Math::Angle getRoll() const;
 
 	/**
 	 * Calculates and returns the angle between the direction the
@@ -593,7 +593,8 @@ private:
 
 	Color _talkColor;
 	Math::Vector3d _pos;
-	Math::Angle _pitch, _yaw, _roll;
+	// Rotation of the actor as a quaternion
+	Math::Quaternion _rot;
 	float _walkRate, _turnRate;
 
 	bool _followBoxes;  // Constrain to walkboxes
@@ -616,9 +617,7 @@ private:
 	// updated to match the movement direction. This produces a smooth
 	// turning animation while still allowing the actor to move in a
 	// new direction immediately after reflecting off a wall.
-	Math::Angle _moveYaw;
-	Math::Angle _movePitch;
-	Math::Angle _moveRoll;
+	Math::Quaternion _turnTo;
 	// This is used to increase momentarily the turn rate when needed
 	float _turnRateMultiplier;
 
